@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="id">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kamera & Deteksi Tangan (Handpose)</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose"></script>
+    <style>
+        /* CSS Minimalis untuk Hanya Menampilkan Kamera */
+        :root {
+            --bg-dark: #121212;
+            --accent-blue: #00bcd4;
+            --accent-green: #4caf50;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-dark);
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+        
+        .container {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .video-container {
+            position: relative;
+            width: 100%; 
+            height: 100%;
+            background-color: #000;
+        }
+        
+        #video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scalex(-1);
+        }
+        
+        .canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        
+        .status {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background-color: rgba(0,0,0,0.5);
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 10;
+        }
+        
+        /* sembunyikan semua elemen lain (sesuai permintaan) */
+        h1, .controls, .finger-info, .instructions {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    
+    <div class="container">
+        <div class="status" id="status">Memuat aplikasi...</div>
+        
+        <div class="video-container">
+            <video id="video" autoplay playsinline muted></video>
+            <div class="canvas-container">
+                <canvas id="canvas"></canvas>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // === KONSTANTA & KONFIGURASI ===
+        const FINGER_POINTS = {
+            THUMB_TIP: 4,
+            INDEX_FINGER_TIP: 8,
+            INDEX_FINGER_PIP: 6,
+            MIDDLE_FINGER_TIP: 12,
+            MIDDLE_FINGER_PIP: 10,
+            RING_FINGER_TIP: 16,
+            RING_FINGER_PIP: 14,
+            PINKY_FINGER_TIP: 20,
+            PINKY_FINGER_PIP: 18,
+            PALM_BASE: 0 
+        };
+
+        const SPEECH_COOLDOWN = 3000;
+        const Y_TOLERANCE = 20;
+        const LANDMARK_COLOR = '#00bcd4'; 
+        const CONNECTION_COLOR = '#4caf50'; 
+        
+        const HAND_CONNECTIONS = [
+            [0, 1], [1, 2], [2, 3], [3, 4],
+            [0, 5], [5, 6], [6, 7], [7, 8],
+            [0, 9], [9, 10], [10, 11], [11, 12],
+            [0, 13], [13, 14], [14, 15], [15, 16],
+            [0, 17], [17, 18], [18, 19], [19, 20]
+        ];
+        
+        // === ELEMEN DOM & VARIABEL GLOBAL ===
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const statusElement = document.getElementById('status');
+        
+        let handposeModel = null;
+        let isRunning = false;
+        let animationId = null;
+        let lastSpeechTime = 0;
+        
+        // === FUNGSI UTILITY ===
+        function updateStatus(message) {
+            if (statusElement) {
+                statusElement.textContent = message;
+            }
+            console.log(message);
+        }
+
+        function drawConnectors(ctx, points, connectors, style = {}) {
+            const { color = 'black', lineWidth = 1 } = style;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = lineWidth;
+            connectors.forEach(([start, end]) => {
+                ctx.beginPath();
+                ctx.moveTo(points[start][0], points[start][1]);
+                ctx.lineTo(points[end][0], points[end][1]);
+                ctx.stroke();
+            });
+        }
+        
+        // === FUNGSI UTAMA ===
+        async function loadHandposeModel() {
+            updateStatus('Memuat TensorFlow.js...');
+            try {
+                // Pastikan TensorFlow.js menggunakan backend yang tepat
+                await tf.setBackend('webgl');
+                updateStatus('Backend TensorFlow.js siap: ' + tf.getBackend());
+                
+                updateStatus('Memuat model deteksi tangan...');
+                handposeModel = await handpose.load();
+                updateStatus('Model berhasil dimuat.');
+                
+                await startDetection();
+            } catch (error) {
+                console.error('Gagal memuat model:', error);
+                updateStatus('Error: ' + error.message);
+                alert('Gagal memuat model. Periksa konsol untuk detail.');
+            }
+        }
+        
+        async function setupCamera() {
+            updateStatus('Mengakses kamera...');
+            
+            // Hentikan stream yang ada jika ada
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+            }
+
+            try {
+                const constraints = {
+                    video: { 
+                        facingMode: 'user', // Gunakan kamera depan
+                        width: { ideal: 640 },
+                        height: { ideal: 480 }
+                    }
+                };
+                
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                
+                return new Promise((resolve, reject) => {
+                    video.onloadedmetadata = () => {
+                        // Set ukuran canvas sesuai dengan video
+                        canvas.width = video.videoWidth;
+                        canvas.height = video.videoHeight;
+                        updateStatus(`Kamera aktif: ${video.videoWidth}x${video.videoHeight}`);
+                        resolve(video);
+                    };
+                    
+                    video.onerror = () => {
+                        reject(new Error('Error memuat video'));
+                    };
+                    
+                    // Timeout untuk kasus video tidak bisa dimuat
+                    setTimeout(() => {
+                        if (video.readyState < 2) {
+                            reject(new Error('Timeout saat memuat video'));
+                        }
+                    }, 5000);
+                });
+            } catch (error) {
+                console.error('Gagal mengakses kamera:', error);
+                updateStatus('Error kamera: ' + error.message);
+                
+                // Fallback: coba dengan constraints yang lebih sederhana
+                try {
+                    updateStatus('Mencoba konfigurasi kamera alternatif...');
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                    video.srcObject = stream;
+                    
+                    return new Promise((resolve) => {
+                        video.onloadedmetadata = () => {
+                            canvas.width = video.videoWidth;
+                            canvas.height = video.videoHeight;
+                            updateStatus(`Kamera aktif (fallback): ${video.videoWidth}x${video.videoHeight}`);
+                            resolve(video);
+                        };
+                    });
+                } catch (fallbackError) {
+                    console.error('Fallback juga gagal:', fallbackError);
+                    alert('Tidak dapat mengakses kamera. Pastikan izin kamera diberikan dan tidak digunakan oleh aplikasi lain.');
+                    return null;
+                }
+            }
+        }
+        
+        function drawHandLandmarks(predictions) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            if (predictions.length > 0) {
+                for (const prediction of predictions) {
+                    const keypoints = prediction.landmarks;
+                    
+                    // Gambar garis penghubung terlebih dahulu (di belakang)
+                    drawConnectors(ctx, keypoints, HAND_CONNECTIONS, {
+                        color: CONNECTION_COLOR,
+                        lineWidth: 3
+                    });
+                    
+                    // Gambar titik-titik landmarks
+                    for (const [x, y] of keypoints) {
+                        ctx.beginPath();
+                        ctx.arc(x, y, 4, 0, 2 * Math.PI);
+                        ctx.fillStyle = LANDMARK_COLOR;
+                        ctx.fill();
+                        ctx.strokeStyle = 'white';
+                        ctx.lineWidth = 1;
+                        ctx.stroke();
+                    }
+                }
+            }
+        }
+        
+        function detectFingersUp(landmarks) {
+            if (!landmarks || landmarks.length === 0) return {};
+
+            const keypoints = landmarks[0].landmarks;
+            
+            let fingers = {
+                indexFingerUp: false,
+                middleFingerUp: false,
+                ringFingerUp: false,
+                pinkyFingerUp: false,
+            };
+
+            // Deteksi jari berdasarkan posisi Y (nilai Y lebih kecil = lebih tinggi di layar)
+            if (keypoints[FINGER_POINTS.INDEX_FINGER_TIP][1] < keypoints[FINGER_POINTS.INDEX_FINGER_PIP][1] - Y_TOLERANCE) {
+                fingers.indexFingerUp = true;
+            }
+            if (keypoints[FINGER_POINTS.MIDDLE_FINGER_TIP][1] < keypoints[FINGER_POINTS.MIDDLE_FINGER_PIP][1] - Y_TOLERANCE) {
+                fingers.middleFingerUp = true;
+            }
+            if (keypoints[FINGER_POINTS.RING_FINGER_TIP][1] < keypoints[FINGER_POINTS.RING_FINGER_PIP][1] - Y_TOLERANCE) {
+                fingers.ringFingerUp = true;
+            }
+            if (keypoints[FINGER_POINTS.PINKY_FINGER_TIP][1] < keypoints[FINGER_POINTS.PINKY_FINGER_PIP][1] - Y_TOLERANCE) {
+                fingers.pinkyFingerUp = true;
+            }
+
+            return fingers;
+        }
+
+        function speak(text) {
+            const now = Date.now();
+            if (now - lastSpeechTime < SPEECH_COOLDOWN) return;
+            
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel();
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = 'id-ID';
+                utterance.rate = 0.9; // Sedikit lebih lambat untuk kejelasan
+                
+                lastSpeechTime = now;
+                window.speechSynthesis.speak(utterance);
+                
+                // Update status saat berbicara
+                updateStatus('Berbicara: ' + text);
+                setTimeout(() => updateStatus('Deteksi tangan aktif'), 2000);
+            }
+        }
+        
+        async function detectionLoop() {
+            if (!isRunning || !handposeModel) {
+                animationId = requestAnimationFrame(detectionLoop);
+                return;
+            }
+            
+            try {
+                const predictions = await handposeModel.estimateHands(video);
+                drawHandLandmarks(predictions);
+                
+                if (predictions.length > 0) {
+                    const fingers = detectFingersUp(predictions);
+                    
+                    // Logika deteksi jari
+                    if (fingers.indexFingerUp && !fingers.middleFingerUp && !fingers.ringFingerUp && !fingers.pinkyFingerUp) {
+                        speak("perkenalkan nama saya fikri asal karawang");
+                    } else if (fingers.indexFingerUp && fingers.middleFingerUp && !fingers.ringFingerUp && !fingers.pinkyFingerUp) {
+                        speak("usia saya 16 tahun");
+                    } else if (fingers.indexFingerUp && fingers.middleFingerUp && fingers.ringFingerUp && !fingers.pinkyFingerUp) {
+                        speak("cita cita saya ingin menjadi ultramen dan saya hobi bermain game");
+                    } else if (fingers.indexFingerUp && fingers.middleFingerUp && fingers.ringFingerUp && fingers.pinkyFingerUp) {
+                        speak("dpr kontol");
+                    }
+                }
+
+            } catch (error) {
+                console.error('Error dalam deteksi:', error);
+            }
+            
+            animationId = requestAnimationFrame(detectionLoop);
+        }
+        
+        async function startDetection() {
+            if (isRunning) return;
+            
+            const cameraReady = await setupCamera();
+            if (!cameraReady) {
+                updateStatus('Kamera tidak tersedia');
+                return;
+            }
+            
+            try {
+                await video.play();
+                isRunning = true;
+                updateStatus('Deteksi tangan aktif');
+                detectionLoop();
+            } catch (error) {
+                console.error('Error memulai video:', error);
+                updateStatus('Error: ' + error.message);
+            }
+        }
+        
+        // Event listener untuk error video
+        video.addEventListener('error', (e) => {
+            console.error('Video error:', e);
+            updateStatus('Error video: ' + e.message);
+        });
+        
+        // Inisialisasi saat halaman dimuat
+        window.addEventListener('load', () => {
+            loadHandposeModel();
+        });
+        
+        // Bersihkan resources saat halaman ditutup
+        window.addEventListener('beforeunload', () => {
+            if (video.srcObject) {
+                video.srcObject.getTracks().forEach(track => track.stop());
+            }
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+        });
+    </script>
+</body>
+</html>
